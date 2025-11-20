@@ -1,0 +1,13 @@
+Temperature and Top-P Explanation (Simple Explanation)
+
+Temperature and Top-P are two settings that control how creative or focused an AI model’s responses are.
+
+Temperature controls randomness. A low temperature, like 0.0 to 0.3, makes the model more accurate, serious, and predictable. It always chooses the most likely answer. A high temperature, like 0.7 to 1.0, makes responses more creative, varied, and exploratory. For this project, a low temperature is ideal because we want fact-based answers from the knowledge base.
+
+Top-P, also called nucleus sampling, decides how much of the model’s probability range is used when generating text. A low top-p, ranging from 0.1 to 0.3, keeps the model very focused and avoids unnecessary or off-topic details. A higher top-p, from 0.8 to 1.0, lets the model consider more possibilities and generate more open-ended responses.
+
+In simple terms:
+
+Temperature = creativity level
+
+Top-P = how wide the model searches for possible words
