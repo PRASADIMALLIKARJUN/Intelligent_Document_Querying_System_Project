@@ -1,0 +1,17 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+
+# Python
+venv/
+__pycache__/
+
+# OS files
+.DS_Store
+
+# Large binaries
+*.exe
+*.zip
+*.tar.gz
