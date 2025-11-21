@@ -69,72 +69,216 @@ Your goal is to provide accurate, document-grounded responses with maximum clari
 """
 
 
+import re
+import json
+import logging
+from typing import Tuple
+
+# ensure bedrock_runtime client exists in your module; create if missing
+import boto3
+try:
+    bedrock_runtime  # type: ignore
+except NameError:
+    try:
+        bedrock_runtime = boto3.client("bedrock-runtime")
+    except Exception:
+        bedrock_runtime = boto3.client("bedrock")  # fallback
+
+# Choose a model for classification (change if you want another)
+MODEL_ID_CLASSIFIER = "amazon.nova-pro-v1:0"
+
+# Developer-provided uploaded file path (will be translated to a URL by the platform)
+FILE_URL = "/mnt/data/machine_files.pdf"
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+
+def _extract_text_from_bedrock_response(raw_response_body: bytes) -> str:
+    """
+    Read and parse the invoke_model response body and return the best-effort text answer.
+    """
+    try:
+        raw_text = raw_response_body.decode("utf-8") if isinstance(raw_response_body, (bytes, bytearray)) else str(raw_response_body)
+    except Exception:
+        raw_text = str(raw_response_body)
+
+    # Try JSON parse and common shapes
+    try:
+        data = json.loads(raw_text)
+    except Exception:
+        return raw_text.strip()
+
+    # format: message -> content -> [ { "text": "..." } ]
+    if isinstance(data, dict):
+        # message.content[0].text
+        msg = data.get("message")
+        if isinstance(msg, dict):
+            content = msg.get("content") or []
+            if isinstance(content, list) and content:
+                first = content[0]
+                if isinstance(first, dict) and "text" in first:
+                    return first["text"].strip()
+                return str(first).strip()
+
+        # outputText
+        if "outputText" in data and isinstance(data["outputText"], str):
+            return data["outputText"].strip()
+
+        # choices path
+        if "choices" in data and isinstance(data["choices"], list) and data["choices"]:
+            choice = data["choices"][0]
+            # nested message/content/text
+            msg = choice.get("message", {})
+            content = msg.get("content") or choice.get("content") or []
+            if isinstance(content, list) and content:
+                first = content[0]
+                if isinstance(first, dict) and "text" in first:
+                    return first["text"].strip()
+                return str(first).strip()
+            if "text" in choice:
+                return choice["text"].strip()
+
+    # fallback: return pretty json string
+    return json.dumps(data, indent=2)[:20000]
+
+
 def valid_prompt(user_input: str) -> Tuple[bool, str]:
     """
-    Check prompt for disallowed requests (PII scraping, illegal or risky financial advice, etc.)
-    Returns (is_valid, reason). If is_valid is False, reason explains why.
+    Use a Bedrock LLM to classify user_input into categories A-E.
+    Return (True, "OK") only if the model returns 'E' (Category E = solely about heavy machinery).
+    Otherwise return (False, <reason>).
+
+    The function:
+      - Sends a short system prompt that defines categories A-E and instructs the model to *return only the letter* (A/B/C/D/E).
+      - Attaches the uploaded file as an attachment so the model can use document context.
+      - Parses the model's answer robustly and checks the returned letter.
+      - If classification fails (call error or no letter), uses a simple keyword heuristic fallback.
     """
-    text = user_input.lower().strip()
+    if not user_input or not user_input.strip():
+        return False, "Empty prompt."
 
-    # Disallow requests for PII (phone numbers, addresses, SSNs, emails)
-    phone_regex = r"(\+?\d{1,3}[\s-]?)?(\(?\d{3}\)?[\s-]?)?\d{3}[\s-]?\d{4}"
-    email_regex = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
-    ssn_regex = r"\b\d{3}-\d{2}-\d{4}\b"
-    address_keywords = ["address", "home address", "phone number", "mobile number", "contact number"]
+    # Trim input for safe sending
+    question = user_input.strip()
 
-    if re.search(phone_regex, text) or re.search(email_regex, text) or re.search(ssn_regex, text):
-        return False, "The request appears to ask for personal contact information; this is not allowed."
+    # System prompt that defines categories and instructs the model to output only the letter A-E.
+    system_prompt = (
+        "You are a strict classifier. There are five categories (A - E). Read the user's prompt and choose the "
+        "single best category letter. Return ONLY the single uppercase letter (A, B, C, D, or E) and nothing else.\n\n"
+        "Category definitions:\n"
+        "A: Questions about general personal finance or life advice (e.g., budgeting, saving goals for a person).\n"
+        "B: Questions about high-level financial concepts or definitions (e.g., 'What is compound interest?') meant for teaching.\n"
+        "C: Administrative or setup requests (e.g., 'connect to my account', 'provide my secret') — out of scope.\n"
+        "D: Requests for personalized or regulated financial advice (investment picks, buy/sell recommendations) — disallowed.\n"
+        "E: Technical questions about heavy machinery, devices, or equipment (e.g., specs, rated power, mechanical parts) "
+        "that are purely about the machine; these are in-scope for the knowledge base. Example valid: 'What is the rated "
+        "power of the XR-220?'.\n\n"
+        "Important: Return only the single uppercase letter for the best category. Do not add any other text or punctuation.\n"
+    )
 
-    if any(kw in text for kw in address_keywords):
-        return False, "The request asks for personal contact or address details; I cannot provide that."
+    # Build the payload for Bedrock invoke_model
+    payload = {
+        "messages": [
+            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": question}],
+                "attachments": [
+                    {"type": "url", "url": FILE_URL}
+                ]
+            }
+        ],
+        "inferenceConfig": {"maxTokens": 10, "temperature": 0.0}
+    }
 
-    # Disallow explicit investment/trading advice that is personalized
-    if any(kw in text for kw in ["should i buy", "stock", "buy shares", "investment advice", "which stock"]):
-        return False, "I cannot give personalized investment advice."
+    # invoke Bedrock
+    try:
+        response = bedrock_runtime.invoke_model(
+            modelId=MODEL_ID_CLASSIFIER,
+            body=json.dumps(payload),
+            contentType="application/json",
+            accept="application/json"
+        )
+        raw_body = response["body"].read()
+        classifier_text = _extract_text_from_bedrock_response(raw_body)
+        logger.info("Classifier output (raw): %s", classifier_text[:200])
+    except Exception as e:
+        logger.exception("Bedrock classification call failed: %s", e)
+        classifier_text = None
 
-    # Disallow instructions for wrongdoing
-    if any(kw in text for kw in ["how to hack", "how to steal", "illegal", "bomb", "explosive"]):
-        return False, "I cannot assist with harmful or illegal activities."
+    # Try to extract letter A-E from classifier output
+    if classifier_text:
+        # Often models return 'E' or 'E\n' or 'E.' etc. Use regex to find first A-E letter.
+        m = re.search(r"\b([A-Ea-e])\b", classifier_text)
+        if m:
+            letter = m.group(1).upper()
+            if letter == "E":
+                return True, "OK (Category E)"
+            else:
+                return False, f"Classified as Category {letter}"
+        # If no direct letter but the text contains spelled-out category, check words
+        if "category e" in classifier_text.lower() or "heavy machinery" in classifier_text.lower():
+            return True, "OK (Category E - detected by text)"
+        # otherwise it was not clearly E
+        return False, f"Classified (model) as non-E: {classifier_text.strip()[:200]}"
 
-    # Allow everything else
-    return True, "OK"
+    # If Bedrock failed or returned nothing, use a simple keyword heuristic fallback:
+    fallback_keywords = [
+        "rated power", "rpm", "motor", "engine", "gearbox", "bearing", "hydraulic",
+        "compressor", "xr-220", "lift capacity", "torque", "specification", "specs", "amp", "kW"
+    ]
+    lower = question.lower()
+    if any(kw in lower for kw in fallback_keywords):
+        return True, "OK (Category E - heuristic fallback)"
+    # If none matched, reject as non-E
+    return False, "Not Category E (heuristic fallback)"
+
+
 
 
 import boto3
 import json
+import logging
 from typing import List, Dict, Any, Optional
 
-# Initialize once (top of file)
-bedrock_client = boto3.client("bedrock")  # matches sample retrieve API
+# Configure logging (adjust as needed)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize the appropriate Bedrock agent runtime client.
+# If your environment uses a different boto3 client name, replace "bedrock-agent-runtime" accordingly.
+try:
+    bedrock_agent_client = boto3.client("bedrock-agent-runtime")
+except Exception:
+    # fallback to "bedrock" in some SDK versions/environments
+    bedrock_agent_client = boto3.client("bedrock")
 
 def query_knowledge_base(
     kb_id: str,
     query: str,
     max_results: int = 5,
-    search_type: str = "HYBRID",   # or "SEMANTIC"
+    search_type: str = "HYBRID",   # "HYBRID" or "SEMANTIC"
     filter_s3_uri: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Query the Bedrock Knowledge Base using the `retrieve` API and return a
-    list of results with the shape:
-      [{"title": ..., "content": ..., "source": ..., "score": ...}, ...]
-
-    - kb_id: the knowledgeBaseId (string)
-    - query: user question text
+    Query the Bedrock Knowledge Base using the retrieve API and return a list of dicts:
+      [{"title": ..., "content": ..., "source": ..., "score": ..., "raw": ...}, ...]
+    - kb_id: knowledgeBaseId (string)
+    - query: user question
     - max_results: number of results to request
     - search_type: "HYBRID" or "SEMANTIC"
-    - filter_s3_uri: optional value to restrict results by metadata key 's3_uri'
+    - filter_s3_uri: optional metadata filter (e.g., "s3://bucket/objects.pdf" or local path)
     """
-    # Build vectorSearchConfiguration
-    vector_search_cfg = {
+
+    # Build vectorSearchConfiguration per reviewer example
+    vector_search_configuration = {
         "numberOfResults": max_results,
         "overrideSearchType": search_type
     }
 
-    # Optional simple equality filter on metadata (example: use the local path as URL)
-    # value can be like "s3://your-bucket/documents/machine_files.pdf" or the local path
+    # Add a simple equals filter if filter_s3_uri provided
     if filter_s3_uri:
-        vector_search_cfg["filter"] = {
+        vector_search_configuration["filter"] = {
             "equals": {
                 "key": "s3_uri",
                 "value": filter_s3_uri
@@ -142,59 +286,69 @@ def query_knowledge_base(
         }
 
     retrieval_configuration = {
-        "vectorSearchConfiguration": vector_search_cfg
+        "vectorSearchConfiguration": vector_search_configuration
     }
 
+    # Compose the retrieve call
     try:
-        response = bedrock_client.retrieve(
+        logger.info("Calling Bedrock retrieve with kb_id=%s query=%s", kb_id, query)
+        response = bedrock_agent_client.retrieve(
             knowledgeBaseId=kb_id,
             retrievalQuery={"text": query},
-            retrievalConfiguration={"vectorSearchConfiguration": vector_search_cfg}
-            # If you have guardrails or nextToken to add, include them here
+            retrievalConfiguration=retrieval_configuration
+            # you can include guardrailConfiguration or nextToken here if needed
         )
     except Exception as e:
-        # Keep failure visible to caller
-        raise RuntimeError(f"KB retrieve failed: {e}")
+        logger.exception("KB retrieve call failed: %s", e)
+        raise
 
-    # Parse results robustly. The exact response shape can vary; handle common fields:
-    results = []
-    # Two common locations: response.get("items") or response.get("results")
-    candidates = response.get("items") or response.get("results") or response.get("matches") or []
+    # Log raw response for debugging (reviewer asked for this)
+    try:
+        logger.debug("Raw retrieve response: %s", json.dumps(response, default=str)[:2000])
+    except Exception:
+        logger.debug("Raw retrieve response (non-serializable), printing repr")
+        logger.debug(repr(response))
+
+    # The official response often places results under 'retrievalResults' or 'items' or 'results'
+    candidates = response.get("retrievalResults") or response.get("items") or response.get("results") or response.get("matches") or []
+
+    results: List[Dict[str, Any]] = []
+
     for item in candidates:
-        # Try several likely nested shapes to extract content/title/source/score
+        # Many response shapes; try common fields
         title = None
         content = None
         source = None
         score = None
 
-        # Example shape: item["document"]["content"] or item["content"]
         if isinstance(item, dict):
-            # document block
-            doc = item.get("document") or item.get("sourceDocument") or item
-            # content text
-            content = (
-                doc.get("content") if isinstance(doc, dict) else None
-            ) or item.get("content") or item.get("text") or None
+            # Standard nested shapes
+            # 1) item.document.content or item.document.sections...
+            doc = item.get("document") or item.get("sourceDocument") or item.get("source") or item
 
-            # title/file name
-            title = (
-                doc.get("title") if isinstance(doc, dict) else None
-            ) or item.get("title") or (doc.get("s3Path") if isinstance(doc, dict) else None)
+            # Try known content placements
+            if isinstance(doc, dict):
+                # content might be under "content", or "text", or "body"
+                content = doc.get("content") or doc.get("text") or doc.get("body")
+                # title might be under doc["title"] or metadata
+                title = doc.get("title")
+                # metadata might contain s3 path or filename
+                metadata = doc.get("metadata") or item.get("metadata") or {}
+                if isinstance(metadata, dict):
+                    # try common keys
+                    source = metadata.get("s3_uri") or metadata.get("s3Path") or metadata.get("source") or metadata.get("file")
+            # fallback: item-level fields
+            content = content or item.get("content") or item.get("text") or item.get("excerpt")
+            title = title or item.get("title") or item.get("documentTitle")
+            score = item.get("score") or item.get("relevanceScore") or item.get("similarityScore")
 
-            # source metadata (s3 path or metadata field)
-            metadata = (doc.get("metadata") if isinstance(doc, dict) else None) or item.get("metadata")
-            if metadata:
-                # try known metadata keys
-                source = metadata.get("s3_uri") or metadata.get("source") or metadata.get("file") or None
-
-            # score / relevance
-            score = item.get("score") or item.get("relevanceScore") or None
-
-        # Fallback: stringify the item
+        # if still no content, stringify a useful subset
         if not content:
-            content = json.dumps(item)[:4096]  # avoid massive blobs
+            try:
+                content = json.dumps(item, default=str)[:4096]
+            except Exception:
+                content = str(item)[:4096]
 
-        # Ensure a readable title/source
         if not title:
             title = source or "unknown"
 
@@ -203,8 +357,13 @@ def query_knowledge_base(
             "content": content,
             "source": source,
             "score": score,
-            "raw": item  # keep raw piece for debugging if needed
+            "raw": item
         })
+
+    # Debug print of parsed results (short)
+    logger.info("Parsed %d KB hits", len(results))
+    for i, r in enumerate(results[:5], 1):
+        logger.debug("Hit %d: title=%s score=%s source=%s", i, r.get("title"), r.get("score"), r.get("source"))
 
     return results
 
@@ -259,112 +418,127 @@ def _parse_bedrock_response(resp_text: str) -> str:
         return str(parsed)
 
 
-def generate_response(system_prompt: str, user_prompt: str, model_id: str = MODEL_ID) -> str:
+import boto3
+import json
+from typing import Optional
+
+# init client (adjust name if your env requires "bedrock" instead)
+try:
+    bedrock_runtime = boto3.client("bedrock-runtime")
+except Exception:
+    bedrock_runtime = boto3.client("bedrock")
+
+# Example local file path (developer-provided upload). This will be transformed to a real URL by the platform.
+FILE_URL = "/mnt/data/machine_files.pdf"
+
+def generate_response(system_prompt: str, user_prompt: str, model_id: str, max_tokens: int = 300) -> str:
     """
-    Final attempt: build messages where messages[0].content is a JSON array of objects
-    that ONLY contain 'text' keys. Include the local file path inside a text object.
-    If that fails, fall back to a single-string messages payload.
+    Invoke a Bedrock model using bedrock_runtime.invoke_model and return plain text answer.
+    Attaches FILE_URL as an attachment for the model to reference.
     """
-    # 1) Validate prompt
-    ok, reason = valid_prompt(user_prompt)
-    if not ok:
-        return f"Request denied: {reason}"
-
-    # 2) Get KB context
-    kb_results = query_knowledge_base(KB_ID, user_prompt, max_results=3)
-    context_parts = []
-    for r in kb_results:
-        content = r.get("content", "")
-        title = r.get("title", "Source")
-        context_parts.append(f"Source: {title}\n{content}")
-    kb_context = "\n\n".join(context_parts) if context_parts else "No KB context found."
-
-    # 3) Build content array with ONLY 'text' fields
-    # Put system instructions and user question in the first text object,
-    # KB context in the second, and local file path in the third (as text).
-    local_file_path = "/mnt/data/machine_files.pdf"  # from conversation history
-
-    first_text = {
-        "text": (
-            f"{system_prompt}\n\nUser question: {user_prompt}\n\n"
-            "Answer ONLY from the knowledge base documents. Cite the document file name when possible."
-        )
-    }
-    kb_text = {
-        "text": f"Knowledge Base context:\n{kb_context}"
-    }
-    file_text = {
-        "text": f"Local document path (for reference): {local_file_path}"
-    }
-
-    content_array = [first_text, kb_text, file_text]
-
-    # Primary payload: messages with content as JSONArray of text objects
-    payload_primary = {
+    # Build messages payload using the messages array format Bedrock expects
+    payload = {
         "messages": [
-            {"role": "user", "content": content_array}
-        ]
+            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": user_prompt}],
+                # attach the file path as a URL; platform/tooling will translate this path to an actual file URL
+                "attachments": [
+                    {"type": "url", "url": FILE_URL}
+                ]
+            }
+        ],
+        "inferenceConfig": {
+            "maxTokens": max_tokens
+        }
     }
 
-    # Fallback payload: messages with single string content (some endpoints accept this)
-    fallback_message = (
-        f"{system_prompt}\n\nUser question: {user_prompt}\n\n"
-        f"Knowledge Base context:\n{kb_context}\n\n"
-        f"Local document path (for reference): {local_file_path}\n\n"
-        "Answer ONLY from the knowledge base documents. Cite the document file name when possible."
-    )
-    payload_fallback = {
-        "messages": [
-            {"role": "user", "content": fallback_message}
-        ]
-    }
-
-    # Try primary format first, then fallback
     try:
         response = bedrock_runtime.invoke_model(
             modelId=model_id,
+            body=json.dumps(payload),
             contentType="application/json",
-            accept="application/json",
-            body=json.dumps(payload_primary)
+            accept="application/json"
         )
-        raw = response["body"].read().decode("utf-8")
-        return _parse_bedrock_response(raw)
-    except Exception as e_primary:
-        # If primary fails, try fallback once and return more informative message if both fail
+
+        # Read and decode the response body
+        raw = response["body"].read()
+        if isinstance(raw, (bytes, bytearray)):
+            raw_text = raw.decode("utf-8")
+        else:
+            raw_text = str(raw)
+
+        # Try to parse JSON — many Bedrock responses are JSON
         try:
-            response = bedrock_runtime.invoke_model(
-                modelId=model_id,
-                contentType="application/json",
-                accept="application/json",
-                body=json.dumps(payload_fallback)
-            )
-            raw = response["body"].read().decode("utf-8")
-            return _parse_bedrock_response(raw)
-        except Exception as e_fallback:
-            return (f"[ERROR] primary attempt failed: {e_primary} -- "
-                    f"fallback attempt failed: {e_fallback}")
+            data = json.loads(raw_text)
+        except Exception:
+            # Not JSON, return raw text
+            return raw_text
+
+        # Common shapes: "message" -> "content" -> [ { "text": "..." } ]
+        if isinstance(data, dict):
+            # 1) message.content[0].text
+            msg = data.get("message")
+            if isinstance(msg, dict):
+                content_list = msg.get("content") or []
+                if isinstance(content_list, list) and len(content_list) > 0:
+                    first = content_list[0]
+                    # many models use "text" field inside the content item
+                    if isinstance(first, dict) and ("text" in first):
+                        return first["text"].strip()
+                    # fallback: string inside content item
+                    return str(first).strip()
+
+            # 2) Some APIs return "outputText"
+            if "outputText" in data and isinstance(data["outputText"], str):
+                return data["outputText"].strip()
+
+            # 3) Some responses use choices -> [ { message: { content: [...] } } ]
+            if "choices" in data and isinstance(data["choices"], list) and len(data["choices"]) > 0:
+                choice = data["choices"][0]
+                # try nested message/content/text
+                msg = choice.get("message") or {}
+                content_list = msg.get("content") or choice.get("content") or []
+                if isinstance(content_list, list) and len(content_list) > 0:
+                    first = content_list[0]
+                    if isinstance(first, dict) and ("text" in first):
+                        return first["text"].strip()
+                    return str(first).strip()
+                # fallback to text field on choice
+                if "text" in choice:
+                    return choice["text"].strip()
+
+        # Final fallback: return the pretty JSON string
+        return json.dumps(data, indent=2)[:10000]
+
+    except Exception as e:
+        # keep the error visible so you can screenshot/log it for the reviewer
+        return f"[ERROR] model invocation failed: {e}"
+
+
 
 
 
 
 # ----------------- Example usage (for testing) -----------------
 if __name__ == "__main__":
-    print("Validating prompt...")
-    user_q = "What is the rated power of the XR-220?"
+    KB_ID = "4GDLZVMOTV"   # replace with your KB id
+    # developer-provided uploaded file path (we use this as an example filter value)
+    SAMPLE_FILE_URL = "/mnt/data/A_flowchart_diagram_illustrates_a_knowledge_base_s.png"
 
-    print("Querying KB and generating response...")
-    raw_answer = generate_response(
-        SYSTEM_PROMPT,
-        user_q,
-        model_id=MODEL_ID
+    hits = query_knowledge_base(
+        kb_id=KB_ID,
+        query="What is the rated power of the XR-220?",
+        max_results=3,
+        search_type="HYBRID",
+        filter_s3_uri=SAMPLE_FILE_URL
     )
 
-    # Optional pretty-print
-    def extract_text_from_response(resp):
-        try:
-            return resp.get("message", {}).get("content", [])[0].get("text")
-        except:
-            return str(resp)
+    print("=== KB HITS ===")
+    for i, h in enumerate(hits, 1):
+        print(f"Hit {i}: title={h['title']}, score={h['score']}, source={h['source']}")
+        print("Excerpt:", (h['content'] or "")[:400])
+        print("---\n")
 
-    print("Answer:\n", extract_text_from_response(raw_answer))
 
