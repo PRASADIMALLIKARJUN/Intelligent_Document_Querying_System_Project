@@ -69,8 +69,6 @@ Your goal is to provide accurate, document-grounded responses with maximum clari
 """
 
 
-
-# ----------------- Safety / prompt validation -----------------
 def valid_prompt(user_input: str) -> Tuple[bool, str]:
     """
     Check prompt for disallowed requests (PII scraping, illegal or risky financial advice, etc.)
@@ -102,39 +100,114 @@ def valid_prompt(user_input: str) -> Tuple[bool, str]:
     return True, "OK"
 
 
-# ----------------- Knowledge Base Query -----------------
-def query_knowledge_base(kb_id: str, query: str, max_results: int = 3) -> List[Dict]:
-    """
-    Query the Bedrock Knowledge Base for relevant context. Returns a list of results (dictionaries)
-    with keys like 'title', 'content', 'source'. Implementation detail:
-      - If your Bedrock account supports a direct KB Query API, call that here.
-      - As a fallback, this implementation demonstrates using a model call to ask the KB
-        via an internal KB-answer endpoint. Replace the placeholder code below with the
-        exact API your account/SDK uses.
-    """
+import boto3
+import json
+from typing import List, Dict, Any, Optional
 
-    # ---- PLACEHOLDER: replace this block with your account's KB query API call ----
-    # Example (pseudocode, not a real API): response = bedrock_client.query_knowledge_base(KbId=kb_id, Query=query)
-    # For now, we'll return a simple placeholder context which generate_response will use.
-    #
-    # If your Bedrock supports an API method to query KB, use that and return a list of items
-    # like: [{"title":"machine_files.pdf","content":"...snippet...", "source":"s3://..."}]
-    #
-    # Example fallback: return the query itself as context (not ideal, but shows structure)
-    print(f"[DEBUG] query_knowledge_base called with kb_id={kb_id}, query={query}")
-    # ---- end placeholder ----
+# Initialize once (top of file)
+bedrock_client = boto3.client("bedrock")  # matches sample retrieve API
 
-    # Placeholder result (you MUST replace with real KB query result)
-    results = [
-        {
-            "title": "machine_files.pdf",
-            "content": "XR-220 Automated Processing Unit — Rated Power: 3.5 kW; Maintenance: clean filters every 100 hours; ...",
-            "source": "s3://s3-bucket-bedrock-project-malli/documents/machine_files.pdf"
+def query_knowledge_base(
+    kb_id: str,
+    query: str,
+    max_results: int = 5,
+    search_type: str = "HYBRID",   # or "SEMANTIC"
+    filter_s3_uri: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Query the Bedrock Knowledge Base using the `retrieve` API and return a
+    list of results with the shape:
+      [{"title": ..., "content": ..., "source": ..., "score": ...}, ...]
+
+    - kb_id: the knowledgeBaseId (string)
+    - query: user question text
+    - max_results: number of results to request
+    - search_type: "HYBRID" or "SEMANTIC"
+    - filter_s3_uri: optional value to restrict results by metadata key 's3_uri'
+    """
+    # Build vectorSearchConfiguration
+    vector_search_cfg = {
+        "numberOfResults": max_results,
+        "overrideSearchType": search_type
+    }
+
+    # Optional simple equality filter on metadata (example: use the local path as URL)
+    # value can be like "s3://your-bucket/documents/machine_files.pdf" or the local path
+    if filter_s3_uri:
+        vector_search_cfg["filter"] = {
+            "equals": {
+                "key": "s3_uri",
+                "value": filter_s3_uri
+            }
         }
-    ]
 
-    # Return up to max_results
-    return results[:max_results]
+    retrieval_configuration = {
+        "vectorSearchConfiguration": vector_search_cfg
+    }
+
+    try:
+        response = bedrock_client.retrieve(
+            knowledgeBaseId=kb_id,
+            retrievalQuery={"text": query},
+            retrievalConfiguration={"vectorSearchConfiguration": vector_search_cfg}
+            # If you have guardrails or nextToken to add, include them here
+        )
+    except Exception as e:
+        # Keep failure visible to caller
+        raise RuntimeError(f"KB retrieve failed: {e}")
+
+    # Parse results robustly. The exact response shape can vary; handle common fields:
+    results = []
+    # Two common locations: response.get("items") or response.get("results")
+    candidates = response.get("items") or response.get("results") or response.get("matches") or []
+    for item in candidates:
+        # Try several likely nested shapes to extract content/title/source/score
+        title = None
+        content = None
+        source = None
+        score = None
+
+        # Example shape: item["document"]["content"] or item["content"]
+        if isinstance(item, dict):
+            # document block
+            doc = item.get("document") or item.get("sourceDocument") or item
+            # content text
+            content = (
+                doc.get("content") if isinstance(doc, dict) else None
+            ) or item.get("content") or item.get("text") or None
+
+            # title/file name
+            title = (
+                doc.get("title") if isinstance(doc, dict) else None
+            ) or item.get("title") or (doc.get("s3Path") if isinstance(doc, dict) else None)
+
+            # source metadata (s3 path or metadata field)
+            metadata = (doc.get("metadata") if isinstance(doc, dict) else None) or item.get("metadata")
+            if metadata:
+                # try known metadata keys
+                source = metadata.get("s3_uri") or metadata.get("source") or metadata.get("file") or None
+
+            # score / relevance
+            score = item.get("score") or item.get("relevanceScore") or None
+
+        # Fallback: stringify the item
+        if not content:
+            content = json.dumps(item)[:4096]  # avoid massive blobs
+
+        # Ensure a readable title/source
+        if not title:
+            title = source or "unknown"
+
+        results.append({
+            "title": title,
+            "content": content,
+            "source": source,
+            "score": score,
+            "raw": item  # keep raw piece for debugging if needed
+        })
+
+    return results
+
 
 
 # ----------------- Generate LLM Response -----------------
